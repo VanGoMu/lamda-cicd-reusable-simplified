@@ -29,7 +29,8 @@ jobs:
 El job `build` corre siempre y sin credenciales: `ruff check` (con la configuración de ruff del
 repositorio que llama, si la tiene), `pytest` y un ZIP reproducible (mismo código, mismos bytes). El job `deploy` solo existe si `environment` no está vacío, corre
 dentro de ese GitHub environment (sus reglas de protección y sus variables) y no se solapa con
-otro despliegue de la misma función y entorno. La plantilla y los scripts se descargan del commit
+otro despliegue de la misma función y entorno. `deploy` hereda los permisos del job que llama: para
+desplegar, ese job concede `id-token: write`; una llamada solo de CI se queda en `contents: read`. La plantilla y los scripts se descargan del commit
 exacto al que apunta `@v1`.
 
 | Input | Defecto | Uso |

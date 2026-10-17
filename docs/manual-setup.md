@@ -133,6 +133,9 @@ sequenceDiagram
 
 Consecuencias prácticas:
 
+- GitHub solo emite el token si el job que llama a `lambda.yml` concede `id-token: write`: el job
+  `deploy` no pide permisos propios, hereda los de la llamada. Una llamada solo de CI no lo concede
+  y no le hace falta.
 - Un job que **no** entra en el environment (el CI de una pull request) recibe otro `sub` y no puede
   asumir el rol: el CI nunca toca AWS, aunque quisiera.
 - El `sub` de `dev` no vale para `prod`: cada entorno tiene su propio rol.
@@ -437,6 +440,7 @@ conservar. A partir del segundo, sí.
 | Síntoma | Causa probable | Qué hacer |
 |---|---|---|
 | El workflow no arranca: no encuentra `lambda.yml@v1` | falta el tag `v1` en la plataforma | paso 1 |
+| `configure-aws-credentials` no consigue el token OIDC | el job que llama no concede `id-token: write` | `permissions: {contents: read, id-token: write}` en ese job |
 | `Not authorized to perform sts:AssumeRoleWithWebIdentity` | el `sub` no coincide: formato (clásico o inmutable) o nombre del entorno | paso 3 y redesplegar el bootstrap |
 | El mismo error, en todos los entornos | la cuenta no tiene proveedor OIDC, o se borró con su stack | paso 2 |
 | `Credentials could not be loaded` o falta `aws-region` | el environment no tiene las variables (o tiene otro nombre) | paso 5: `gh variable list --env <entorno>` |

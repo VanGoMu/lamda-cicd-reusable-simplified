@@ -5,7 +5,8 @@ name: lambda
 #   deploy -> only with `environment`: stack <function-name>-<environment>, alias `live`
 #             (optionally as a canary) and smoke test, through scripts/deploy.sh.
 # AWS settings: AWS_REGION, AWS_ROLE_ARN, CFN_ROLE_ARN and ARTIFACT_BUCKET, variables of the
-# caller's GitHub environment. The calling job must grant `id-token: write`.
+# caller's GitHub environment. To deploy, the calling job must grant `id-token: write`; a CI-only
+# call (no `environment`) needs `contents: read` and nothing else.
 
 on:
   workflow_call:
@@ -36,8 +37,7 @@ on:
       alias-arn: {value: '${{ jobs.deploy.outputs.alias-arn }}'}
       version: {value: '${{ jobs.deploy.outputs.version }}'}
 
-permissions:
-  contents: read
+# No workflow-level permissions: they would also cap the deploy job (see below).
 
 env:
   RUFF_VERSION: 0.17.1
@@ -48,6 +48,8 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
       - name: Validate inputs
         id: inputs
@@ -125,9 +127,9 @@ jobs:
     concurrency:
       group: lambda-${{ github.repository }}-${{ inputs.function-name }}-${{ inputs.environment }}
       cancel-in-progress: false
-    permissions:
-      contents: read
-      id-token: write
+    # No permissions block on purpose: the job inherits the caller's, which must include
+    # `id-token: write`. Asking for it here makes GitHub reject every call that does not grant
+    # it, CI-only calls included, even though this job is skipped for them.
     outputs:
       function-arn: ${{ steps.deploy.outputs.function-arn }}
       alias-arn: ${{ steps.deploy.outputs.alias-arn }}
