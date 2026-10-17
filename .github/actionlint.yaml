@@ -1,0 +1,6 @@
+# actionlint 1.7.12 (latest release) predates job.workflow_repository / job.workflow_sha,
+# which GitHub documents in the job context. Drop this once actionlint knows them.
+paths:
+  .github/workflows/**/*.yml:
+    ignore:
+      - 'property "workflow_(sha|repository)" is not defined in object type'

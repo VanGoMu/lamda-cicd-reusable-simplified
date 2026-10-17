@@ -1,0 +1,156 @@
+name: lambda
+
+# Tests, packages and deploys ONE Python Lambda function, configured by its inputs (README.md).
+#   build  -> ruff + pytest + reproducible ZIP, without AWS credentials.
+#   deploy -> only with `environment`: stack <function-name>-<environment>, alias `live`
+#             (optionally as a canary) and smoke test, through scripts/deploy.sh.
+# AWS settings: AWS_REGION, AWS_ROLE_ARN, CFN_ROLE_ARN and ARTIFACT_BUCKET, variables of the
+# caller's GitHub environment. The calling job must grant `id-token: write`.
+
+on:
+  workflow_call:
+    inputs:
+      function-name: {type: string, required: true}
+      source-dir: {type: string, required: true}
+      tests-dir: {type: string, default: ''}
+      handler: {type: string, default: app.handler}
+      runtime: {type: string, default: python3.13}
+      architecture: {type: string, default: arm64}
+      memory: {type: number, default: 128}
+      timeout: {type: number, default: 10}
+      environment-variables: {type: string, default: ''}
+      environment: {type: string, default: ''}
+      reserved-concurrency: {type: string, default: ''}
+      canary-percent: {type: number, default: 0}
+      canary-minutes: {type: number, default: 5}
+      exposure: {type: string, default: none}
+      alb-listener-arn: {type: string, default: ''}
+      alb-path: {type: string, default: ''}
+      alb-priority: {type: string, default: ''}
+      api-id: {type: string, default: ''}
+      api-route: {type: string, default: ''}
+      smoke-event: {type: string, default: ''}
+      smoke-check: {type: string, default: .statusCode == 200}
+    outputs:
+      function-arn: {value: '${{ jobs.deploy.outputs.function-arn }}'}
+      alias-arn: {value: '${{ jobs.deploy.outputs.alias-arn }}'}
+      version: {value: '${{ jobs.deploy.outputs.version }}'}
+
+permissions:
+  contents: read
+
+env:
+  RUFF_VERSION: 0.17.1
+  PYTEST_VERSION: 9.1.1
+  ARTIFACT: lambda-${{ inputs.function-name }}-${{ inputs.environment || 'ci' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Validate inputs
+        id: inputs
+        env:
+          INPUTS: ${{ toJSON(inputs) }}
+        run: |
+          get() { jq -r --arg k "$1" '.[$k] // "" | tostring' <<<"${INPUTS}"; }
+          fail() { echo "::error::$*"; exit 1; }
+          [[ "$(get function-name)-$(get environment)" =~ ^[a-zA-Z][a-zA-Z0-9-]{0,63}$ ]] \
+            || fail "function-name-environment: letters, digits and '-', 64 characters at most"
+          case "$(get exposure)" in
+            none) ;;
+            alb) [[ -n "$(get alb-listener-arn)" && -n "$(get alb-path)" \
+                && "$(get alb-priority)" =~ ^[0-9]+$ ]] \
+                || fail "exposure alb needs alb-listener-arn, alb-path and numeric alb-priority" ;;
+            api-gateway) [[ -n "$(get api-id)" && "$(get api-route)" == *" /"* ]] \
+                || fail "exposure api-gateway needs api-id and api-route ('GET /path')" ;;
+            *) fail "exposure must be none, alb or api-gateway" ;;
+          esac
+          percent="$(get canary-percent)" minutes="$(get canary-minutes)"
+          ((percent >= 0 && percent <= 99)) || fail "canary-percent: 0-99"
+          ((percent == 0 || (minutes >= 1 && minutes <= 30))) || fail "canary-minutes: 1-30"
+          [[ "$(get reserved-concurrency)" =~ ^[0-9]*$ ]] || fail "reserved-concurrency: a number"
+          jq -e '."environment-variables" | . == ""
+            or (fromjson | type == "object" and all(.[]; type == "string"))' <<<"${INPUTS}" \
+            >/dev/null || fail 'environment-variables: a JSON object of strings, {"K":"v"}'
+          echo "python=$(get runtime | sed 's/^python//')" >>"${GITHUB_OUTPUT}"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The platform itself, at the exact commit the caller pinned (@v1 -> its SHA).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .platform
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ steps.inputs.outputs.python }}
+      - name: Lint and test
+        env:
+          SRC: ${{ inputs.source-dir }}
+          TESTS: ${{ inputs.tests-dir }}
+        run: |
+          pip install --quiet "ruff==${RUFF_VERSION}" "pytest==${PYTEST_VERSION}"
+          [[ -n "${TESTS}" && -d "${TESTS}" ]] || TESTS=""
+          ruff check "${SRC}" ${TESTS:+"${TESTS}"}
+          [[ -n "${TESTS}" ]] || exit 0
+          requirements="$(dirname "${SRC}")/requirements.txt"
+          [[ ! -f "${requirements}" ]] || pip install --quiet -r "${requirements}"
+          PYTHONPATH="${SRC}" python -m pytest -q "${TESTS}"
+      - name: Package
+        env:
+          SRC: ${{ inputs.source-dir }}
+          RUNTIME: ${{ inputs.runtime }}
+          ARCH: ${{ inputs.architecture }}
+          SMOKE_EVENT: ${{ inputs.smoke-event }}
+        run: |
+          .platform/scripts/package.sh "${SRC}" "${RUNNER_TEMP}/dist/function.zip" \
+            "${RUNTIME}" "${ARCH}"
+          [[ -z "${SMOKE_EVENT}" ]] || cp "${SMOKE_EVENT}" "${RUNNER_TEMP}/dist/smoke-event.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ env.ARTIFACT }}
+          path: ${{ runner.temp }}/dist
+          retention-days: 7
+
+  deploy:
+    needs: build
+    if: inputs.environment != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: lambda-${{ github.repository }}-${{ inputs.function-name }}-${{ inputs.environment }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      function-arn: ${{ steps.deploy.outputs.function-arn }}
+      alias-arn: ${{ steps.deploy.outputs.alias-arn }}
+      version: ${{ steps.deploy.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .platform
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ env.ARTIFACT }}
+          path: ${{ runner.temp }}/dist
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Deploy
+        id: deploy
+        env:
+          INPUTS: ${{ toJSON(inputs) }}
+          CFN_ROLE_ARN: ${{ vars.CFN_ROLE_ARN }}
+          ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET }}
+        run: .platform/scripts/deploy.sh "${RUNNER_TEMP}/dist"

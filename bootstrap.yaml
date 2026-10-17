@@ -1,0 +1,168 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  lamda-cicd-reusable-simplified, one GitHub environment: artifact bucket, CloudFormation
+  service role and the role GitHub Actions assumes through OIDC.
+
+Parameters:
+  GitHubSubject:
+    Type: String
+    Description: Exact OIDC sub claim, e.g. repo:owner/repo:environment:prod (see README).
+    AllowedPattern: '^repo:.+:environment:.+$'
+  NamePrefix:
+    Type: String
+    Description: Every function deployed through this environment must start with it.
+    AllowedPattern: '^[a-z][a-z0-9-]{1,19}$'
+  CreateOidcProvider:
+    Type: String
+    Description: true if the account has no token.actions.githubusercontent.com provider yet.
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+
+Conditions:
+  NewOidcProvider: !Equals [!Ref CreateOidcProvider, 'true']
+
+Resources:
+  OidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: NewOidcProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      VersioningConfiguration: {Status: Enabled}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true,
+                                       IgnorePublicAcls: true, RestrictPublicBuckets: true}
+
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: TlsOnly
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource: [!GetAtt ArtifactBucket.Arn, !Sub '${ArtifactBucket.Arn}/*']
+            Condition: {Bool: {aws:SecureTransport: 'false'}}
+
+  # Creates the function stacks. Only resources named <NamePrefix>*, except listener rules and
+  # HTTP API routes, whose ARNs carry generated ids instead of names.
+  CloudFormationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: cloudformation.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: function-stacks
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Each action only matches the ARNs of its own service.
+              - Effect: Allow
+                Action: [lambda:*, logs:*, cloudwatch:*, elasticloadbalancing:*]
+                Resource:
+                  - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${NamePrefix}*
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${NamePrefix}*
+                  - !Sub arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${NamePrefix}*
+                  - !Sub arn:${AWS::Partition}:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:targetgroup/${NamePrefix}*
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion]
+                Resource: !Sub ${ArtifactBucket.Arn}/*
+              - Effect: Allow
+                Action: [iam:CreateRole, iam:DeleteRole, iam:GetRole, iam:UpdateRole*,
+                         iam:*RolePolicy, iam:List*RolePolicies, iam:TagRole, iam:UntagRole]
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/lambda/${NamePrefix}*
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/lambda/${NamePrefix}*
+                Condition: {StringEquals: {iam:PassedToService: lambda.amazonaws.com}}
+              - Effect: Allow
+                Action: [elasticloadbalancing:CreateRule, elasticloadbalancing:ModifyRule,
+                         elasticloadbalancing:DeleteRule, elasticloadbalancing:SetRulePriorities,
+                         elasticloadbalancing:AddTags, elasticloadbalancing:RemoveTags]
+                Resource:
+                  - !Sub arn:${AWS::Partition}:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:listener/app/*
+                  - !Sub arn:${AWS::Partition}:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:listener-rule/app/*
+              # POST creates on the collection (/routes), the rest acts on /routes/<id>.
+              - Effect: Allow
+                Action: [apigateway:GET, apigateway:POST, apigateway:PATCH, apigateway:PUT,
+                         apigateway:DELETE]
+                Resource:
+                  - !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}::/apis/*/routes*
+                  - !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}::/apis/*/integrations*
+              - Effect: Allow
+                Action: [logs:Describe*, elasticloadbalancing:Describe*, ec2:DescribeVpcs,
+                         apigateway:GET]
+                Resource: '*'
+
+  # Assumed by the deploy job. It cannot create resources itself: it hands the template to
+  # CloudFormation together with the service role above.
+  GitHubRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - NewOidcProvider
+                - !Ref OidcProvider
+                - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Ref GitHubSubject
+      Policies:
+        - PolicyName: deploy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: cloudformation:*
+                Resource:
+                  - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${NamePrefix}*/*
+                  - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:changeSet/awscli-cloudformation-package-deploy-*/*
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CloudFormationRole.Arn
+                Condition: {StringEquals: {iam:PassedToService: cloudformation.amazonaws.com}}
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource: !Sub ${ArtifactBucket.Arn}/*
+              # Smoke test and canary watch.
+              - Effect: Allow
+                Action: [lambda:InvokeFunction, cloudwatch:DescribeAlarms]
+                Resource:
+                  - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${NamePrefix}*
+                  - !Sub arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${NamePrefix}*
+
+# The description of each output is the GitHub environment variable it fills (see README).
+Outputs:
+  Region:
+    Description: AWS_REGION
+    Value: !Ref AWS::Region
+  GitHubRoleArn:
+    Description: AWS_ROLE_ARN
+    Value: !GetAtt GitHubRole.Arn
+  CloudFormationRoleArn:
+    Description: CFN_ROLE_ARN
+    Value: !GetAtt CloudFormationRole.Arn
+  ArtifactBucket:
+    Description: ARTIFACT_BUCKET
+    Value: !Ref ArtifactBucket

@@ -1,0 +1,62 @@
+name: self-test
+
+# lint   -> shellcheck, cfn-lint (plain and rendered with every exposure, canary on and off),
+#           actionlint and a reproducible-ZIP check
+# example -> lambda.yml from this very commit, CI only (no environment), on examples/hello
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: shellcheck
+        run: bash -n scripts/*.sh && shellcheck -x scripts/*.sh
+      - name: cfn-lint
+        run: |
+          pip install --quiet cfn-lint==1.57.2
+          cfn-lint template.yaml bootstrap.yaml
+          for exposure in none alb api-gateway; do
+            for weight in 0 0.1; do
+              echo "Exposure=${exposure} CanaryWeight=${weight}"
+              cfn-lint --parameters FunctionName=fn-ci VersionHash=0 StableVersion=1 \
+                TrafficMode=canary "CanaryWeight=${weight}" "Exposure=${exposure}" \
+                TargetGroupName=fn-ci AlbPath='/hello*' AlbPriority=110 ApiId=a1b2c3 \
+                'ApiRouteKey=GET /hello' \
+                AlbListenerArn=arn:aws:elasticloadbalancing:eu-west-1:123456789012:listener/app/a/1/2 \
+                -- template.yaml
+            done
+          done
+      - name: actionlint
+        run: >-
+          docker run --rm -v "${PWD}:/repo" -w /repo
+          rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+          -no-color
+      - name: Reproducible ZIP
+        run: |
+          scripts/package.sh examples/hello/src "${RUNNER_TEMP}/a.zip"
+          sleep 2
+          scripts/package.sh examples/hello/src "${RUNNER_TEMP}/b.zip"
+          cmp "${RUNNER_TEMP}/a.zip" "${RUNNER_TEMP}/b.zip"
+
+  example:
+    uses: ./.github/workflows/lambda.yml
+    with:
+      function-name: hello
+      source-dir: examples/hello/src
+      tests-dir: examples/hello/tests
+      smoke-event: examples/hello/event.json

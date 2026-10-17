@@ -1,0 +1,200 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  One Lambda function behind the alias `live`: version, canary weights, reserved concurrency
+  and, optionally, a route on an existing ALB listener or HTTP API. Deployed by scripts/deploy.sh.
+
+Parameters:
+  FunctionName: {Type: String, AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]{0,63}$'}
+  Handler: {Type: String, Default: app.handler}
+  Runtime: {Type: String, Default: python3.13}
+  Architecture: {Type: String, Default: arm64, AllowedValues: [arm64, x86_64]}
+  MemorySize: {Type: Number, Default: 128, MinValue: 128, MaxValue: 10240}
+  Timeout: {Type: Number, Default: 10, MinValue: 1, MaxValue: 900}
+  # SHA-256 of the ZIP and of the configuration Lambda versions (computed by deploy.sh).
+  VersionHash: {Type: String}
+  TrafficMode: {Type: String, Default: all, AllowedValues: [all, hold, canary]}
+  StableVersion: {Type: String, Default: ''}
+  CanaryWeight: {Type: Number, Default: 0, MinValue: 0, MaxValue: 0.99}
+  ReservedConcurrency: {Type: String, Default: '', AllowedPattern: '^[0-9]*$'}
+  Exposure: {Type: String, Default: none, AllowedValues: [none, alb, api-gateway]}
+  TargetGroupName: {Type: String, Default: ''}
+  AlbListenerArn: {Type: String, Default: ''}
+  AlbPath: {Type: String, Default: ''}
+  AlbPriority: {Type: String, Default: '', AllowedPattern: '^[0-9]*$'}
+  ApiId: {Type: String, Default: ''}
+  ApiRouteKey: {Type: String, Default: ''}
+
+Conditions:
+  HasConcurrency: !Not [!Equals [!Ref ReservedConcurrency, '']]
+  HasCanary: !Not [!Equals [!Ref CanaryWeight, '0']]
+  AllTraffic: !Equals [!Ref TrafficMode, all]
+  InCanary: !Equals [!Ref TrafficMode, canary]
+  WithAlb: !Equals [!Ref Exposure, alb]
+  WithApi: !Equals [!Ref Exposure, api-gateway]
+
+Resources:
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${FunctionName}
+      RetentionInDays: 30
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /lambda/
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: own-log-group
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt LogGroup.Arn
+
+  Function:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn-lint: {config: {ignore_checks: [W3002]}}  # Code stays local until package
+    Properties:
+      FunctionName: !Ref FunctionName
+      Code: function.zip  # local path: `aws cloudformation package` uploads it and rewrites this
+      Handler: !Ref Handler
+      Runtime: !Ref Runtime
+      Architectures: [!Ref Architecture]
+      MemorySize: !Ref MemorySize
+      Timeout: !Ref Timeout
+      Role: !GetAtt ExecutionRole.Arn
+      ReservedConcurrentExecutions:
+        !If [HasConcurrency, !Ref ReservedConcurrency, !Ref AWS::NoValue]
+
+  # Description only changes with VersionHash, and changing it replaces the resource: that is
+  # what publishes a new version. Retain keeps the replaced one, which the alias may still serve
+  # (hold and canary) and which is the way back.
+  Version:
+    Type: AWS::Lambda::Version
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Retain
+    Properties:
+      FunctionName: !Ref Function
+      Description: !Ref VersionHash
+
+  # all: new version 100 %. hold: stable version 100 %, the new one published but idle.
+  # canary: stable version plus CanaryWeight on the new one.
+  Alias:
+    Type: AWS::Lambda::Alias
+    Properties:
+      FunctionName: !Ref Function
+      Name: live
+      FunctionVersion: !If [AllTraffic, !GetAtt Version.Version, !Ref StableVersion]
+      RoutingConfig:
+        # An empty list rather than AWS::NoValue, so the weights of a canary are cleared.
+        AdditionalVersionWeights: !If
+          - InCanary
+          - - FunctionVersion: !GetAtt Version.Version
+              FunctionWeight: !Ref CanaryWeight
+          - []
+
+  # Errors of the new version only (ExecutedVersion), so a failing stable version cannot
+  # abort every canary.
+  CanaryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasCanary
+    Properties:
+      AlarmName: !Sub ${FunctionName}-canary-errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - {Name: FunctionName, Value: !Ref FunctionName}
+        - {Name: Resource, Value: !Sub '${FunctionName}:live'}
+        - {Name: ExecutedVersion, Value: !GetAtt Version.Version}
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  # The ALB checks it may invoke the target when the target group registers it, so the
+  # permission comes first. Its SourceArn is built from the name (wildcard id) instead of
+  # !Ref TargetGroup, which would close a dependency cycle.
+  AlbPermission:
+    Type: AWS::Lambda::Permission
+    Condition: WithAlb
+    Properties:
+      FunctionName: !Ref Alias
+      Action: lambda:InvokeFunction
+      Principal: elasticloadbalancing.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:targetgroup/${TargetGroupName}/*
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: WithAlb
+    DependsOn: AlbPermission
+    Properties:
+      Name: !Ref TargetGroupName
+      TargetType: lambda
+      Targets:
+        - Id: !Ref Alias
+
+  ListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: WithAlb
+    Metadata:
+      cfn-lint: {config: {ignore_checks: [W1030]}}  # a string, so it can be empty without ALB
+    Properties:
+      ListenerArn: !Ref AlbListenerArn
+      Priority: !Ref AlbPriority
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values: [!Ref AlbPath]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  ApiPermission:
+    Type: AWS::Lambda::Permission
+    Condition: WithApi
+    Properties:
+      FunctionName: !Ref Alias
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiId}/*/*
+
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Condition: WithApi
+    Properties:
+      ApiId: !Ref ApiId
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Ref Alias
+      PayloadFormatVersion: '2.0'
+
+  ApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: WithApi
+    Properties:
+      ApiId: !Ref ApiId
+      RouteKey: !Ref ApiRouteKey
+      Target: !Sub integrations/${ApiIntegration}
+
+Outputs:
+  FunctionArn:
+    Value: !GetAtt Function.Arn
+  AliasArn:
+    Value: !Ref Alias
+  NewVersion:
+    Value: !GetAtt Version.Version
+  LiveVersion:
+    Description: Version that takes the bulk of the alias traffic.
+    Value: !If [AllTraffic, !GetAtt Version.Version, !Ref StableVersion]
+  CanaryAlarmName:
+    Condition: HasCanary
+    Value: !Ref CanaryAlarm

@@ -1,0 +1,33 @@
+# .github/workflows/lambda.yml of a repository of functions.
+#   pull request -> CI only (no environment, no AWS)
+#   push to main -> environment dev, direct deployment
+#   tag v*       -> environment prod, 10 % canary for 5 minutes
+name: lambda
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  hello:
+    uses: VanGoMu/lamda-cicd-reusable-simplified/.github/workflows/lambda.yml@v1
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      function-name: lfs-hello
+      source-dir: lambdas/hello/src
+      tests-dir: lambdas/hello/tests
+      smoke-event: lambdas/hello/event.json
+      environment-variables: '{"GREETING": "Hello"}'
+      # '' (pull request) skips the deploy job.
+      environment: >-
+        ${{ github.event_name == 'push'
+            && (github.ref_type == 'tag' && 'prod' || 'dev') || '' }}
+      canary-percent: ${{ github.ref_type == 'tag' && 10 || 0 }}
+      canary-minutes: 5
